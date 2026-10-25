@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import {
   Heart, CalendarDays, Sparkles, BookHeart, Leaf, ShieldCheck,
   Plus, ChevronLeft, ChevronRight, Wind, Smile, Trash2, LogOut,
-  Cloud, CloudOff, LockKeyhole, UserRound, CheckCircle2, CircleHelp
+  Cloud, CloudOff, LockKeyhole, UserRound, CheckCircle2, CircleHelp, Play, Pause, RotateCcw, Timer, Check
 } from "lucide-react";
 import { hasSupabaseConfig, supabase } from "./supabase.js";
 
@@ -23,6 +23,11 @@ const exercises = {
   calm: { title:"Let's make a little room to breathe.", body:"Relax your shoulders if that feels comfortable. Notice your feet on the ground. Breathe normally, and let your next few exhales be gentle. You can stop whenever you want." },
   thoughts: { title:"Let's untangle one thought at a time.", body:"Try writing: What happened? What am I telling myself it means? What else could be true? You don't need to force a positive answer—just make space for another possibility." },
   distract: { title:"A tiny reset counts.", body:"Pick one small thing: play a favourite song, watch something funny, stretch gently, make a warm drink, or look outside for a minute. No need to fix everything right now." }
+};
+const breathingPresets = {
+  gentle: { name:"Gentle reset", subtitle:"A relaxed, no-pressure rhythm", duration:60, phases:[{label:"Breathe in gently",seconds:3},{label:"Breathe out slowly",seconds:4}], note:"Let your breath stay natural and comfortable. No need to take deep breaths." },
+  unwind: { name:"Longer exhale", subtitle:"A soft way to slow things down", duration:90, phases:[{label:"Breathe in",seconds:4},{label:"Breathe out",seconds:6}], note:"Try a comfortable inhale and a slightly longer exhale. Shorten the count if needed." },
+  box: { name:"Box breathing", subtitle:"An even, steady rhythm", duration:60, phases:[{label:"Breathe in",seconds:4},{label:"Pause gently",seconds:4},{label:"Breathe out",seconds:4},{label:"Pause gently",seconds:4}], note:"Optional holds only. Skip either pause and breathe normally if holding feels uncomfortable." }
 };
 const supportOptions = [
   ["checkin","A gentle check-in later"],
@@ -65,10 +70,34 @@ export default function App() {
   const [partnerEnabled,setPartnerEnabled] = useState(false);
   const [partnerStatus,setPartnerStatus] = useState("");
   const [partnerNotifications,setPartnerNotifications] = useState([]);
+  const [breathingType,setBreathingType] = useState("gentle");
+  const [breathingRunning,setBreathingRunning] = useState(false);
+  const [breathingElapsed,setBreathingElapsed] = useState(0);
+  const [breathingFinished,setBreathingFinished] = useState(false);
 
   useEffect(() => {
     localStorage.setItem(LOCAL_KEY, JSON.stringify(data));
   },[data]);
+
+  useEffect(() => {
+    if (!breathingRunning) return;
+    const timer = window.setInterval(() => {
+      setBreathingElapsed(prev => {
+        const next = prev + 1;
+        if (next >= breathingPresets[breathingType].duration) {
+          setBreathingRunning(false);
+          setBreathingFinished(true);
+          return breathingPresets[breathingType].duration;
+        }
+        return next;
+      });
+    },1000);
+    return () => window.clearInterval(timer);
+  },[breathingRunning,breathingType]);
+
+  useEffect(() => {
+    if (tab !== "calm") setBreathingRunning(false);
+  },[tab]);
 
   useEffect(() => {
     if (!hasSupabaseConfig) return;
@@ -129,49 +158,78 @@ export default function App() {
   }
 
   function mergeCloud(rows) {
-    const next=freshData();
-    for (const row of rows || []) {
-      const p=row.payload || {};
-      if (row.kind==="period") next.periods.push(p);
-      if (row.kind==="checkin") next.checkins.push(p);
-      if (row.kind==="journal") next.journal.push(p);
-      if (row.kind==="settings") next.supportPreference=p.supportPreference || "checkin";
-    }
-    setData(next);
+    // Merge by entry ID so loading cloud data never silently erases local-only entries.
+    setData((local) => {
+      const next = {
+        ...freshData(),
+        periods: [...local.periods],
+        checkins: [...local.checkins],
+        journal: [...local.journal],
+        supportPreference: local.supportPreference || "checkin",
+      };
+      const addUnique = (target, payload) => {
+        if (!payload?.id) return;
+        if (!target.some((item) => item.id === payload.id)) target.push(payload);
+      };
+      for (const row of rows || []) {
+        const payload = row.payload || {};
+        if (row.kind === "period") addUnique(next.periods, payload);
+        if (row.kind === "checkin") addUnique(next.checkins, payload);
+        if (row.kind === "journal") addUnique(next.journal, payload);
+        if (row.kind === "settings") next.supportPreference = payload.supportPreference || next.supportPreference;
+      }
+      return next;
+    });
   }
+
   async function loadCloudData() {
-    if (!supabase || !user) return;
+    if (!supabase || !user) {
+      setNotice("Sign in first to load cloud data.");
+      return;
+    }
     setSyncBusy(true);
     try {
-      const {data:rows,error}=await supabase.from("wellness_entries").select("id,kind,payload,created_at").eq("user_id",user.id).order("created_at",{ascending:true});
+      const { data: rows, error } = await supabase
+        .from("wellness_entries")
+        .select("id,kind,payload,created_at")
+        .eq("user_id", user.id)
+        .order("created_at", { ascending: true });
       if (error) throw error;
       mergeCloud(rows);
-      setNotice("Private cloud data loaded for your account.");
-    } catch(err) { setNotice(`Cloud sync couldn't load: ${err.message}`); }
-    finally { setSyncBusy(false); }
+      setNotice("Cloud data loaded and merged with this device's entries.");
+    } catch (err) {
+      setNotice(`Cloud sync couldn't load: ${err.message}`);
+    } finally {
+      setSyncBusy(false);
+    }
   }
-  async function syncToCloud(nextData=data) {
-    if (!supabase || !user || !cloudEnabled) {
+
+  async function syncToCloud(nextData = data, force = false) {
+    if (!supabase || !user || (!cloudEnabled && !force)) {
       setNotice("Cloud sync is off. Your information remains on this device.");
       return;
     }
     setSyncBusy(true);
     try {
-      const entries=[
-        ...nextData.periods.map(p=>({user_id:user.id,kind:"period",entry_key:p.id,payload:p})),
-        ...nextData.checkins.map(p=>({user_id:user.id,kind:"checkin",entry_key:p.id,payload:p})),
-        ...nextData.journal.map(p=>({user_id:user.id,kind:"journal",entry_key:p.id,payload:p})),
-        {user_id:user.id,kind:"settings",entry_key:"preferences",payload:{supportPreference:nextData.supportPreference}}
+      const entries = [
+        ...nextData.periods.map((p) => ({ user_id: user.id, kind: "period", entry_key: p.id, payload: p })),
+        ...nextData.checkins.map((p) => ({ user_id: user.id, kind: "checkin", entry_key: p.id, payload: p })),
+        ...nextData.journal.map((p) => ({ user_id: user.id, kind: "journal", entry_key: p.id, payload: p })),
+        { user_id: user.id, kind: "settings", entry_key: "preferences", payload: { supportPreference: nextData.supportPreference } },
       ];
-      const {error:deleteError}=await supabase.from("wellness_entries").delete().eq("user_id",user.id);
-      if (deleteError) throw deleteError;
-      if (entries.length) {
-        const {error}=await supabase.from("wellness_entries").insert(entries);
-        if (error) throw error;
-      }
+
+      // Upsert avoids deleting all existing cloud rows before attempting a replacement.
+      // The schema must have a unique constraint on (user_id, kind, entry_key).
+      const { error } = await supabase
+        .from("wellness_entries")
+        .upsert(entries, { onConflict: "user_id,kind,entry_key" });
+      if (error) throw error;
       setNotice("Your selected data was synced to your private account.");
-    } catch(err) { setNotice(`Sync failed: ${err.message}`); }
-    finally { setSyncBusy(false); }
+    } catch (err) {
+      setNotice(`Sync failed: ${err.message}`);
+    } finally {
+      setSyncBusy(false);
+    }
   }
   function updateData(mutator) {
     setData(prev=>{
@@ -237,8 +295,9 @@ export default function App() {
     if (checked) {
       const okay=window.confirm("Enable cloud sync for this account? Your current cycle entries, check-ins, journal entries, and support preference will be uploaded to your authenticated account. Continue only if this is your own account and you want this data in the cloud.");
       if (!okay) return;
+      // Pass force=true because React state updates are asynchronous.
+      await syncToCloud(data, true);
       setCloudEnabled(true);
-      await syncToCloud(data);
     } else {
       setCloudEnabled(false);
       setNotice("Cloud sync turned off. Previously synced copies remain in your account until you delete them.");
@@ -296,7 +355,19 @@ export default function App() {
 
       {tab==="checkin" && <section className="page"><Back onClick={()=>setTab("home")}/><span className="eyebrow">A MOMENT FOR YOU</span><h1>How are you <em>really feeling?</em></h1><p className="intro">No right answers. Choose what feels closest, or skip this whenever you want.</p><div className="moods">{moods.map(m=><button key={m.id} className={mood===m.id?"active":""} onClick={()=>setMood(m.id)}><span>{m.emoji}</span><strong>{m.label}</strong></button>)}</div><div className="card"><h2>What would help right now?</h2><div className="choices">{[["calm","Help me calm down"],["thoughts","Help me untangle my thoughts"],["distract","Give me a gentle distraction"]].map(([k,v])=><button key={k} className={exercise===k?"chosen":""} onClick={()=>setExercise(k)}>{v}{exercise===k&&" ✓"}</button>)}</div><div className="exercise"><span><Wind/></span><h3>{exercises[exercise].title}</h3><p>{exercises[exercise].body}</p></div><button className="primary full" onClick={addCheckin}>Save my check-in</button></div></section>}
 
-      {tab==="calm" && <section className="page"><Back onClick={()=>setTab("home")}/><span className="eyebrow">PSYCHOLOGY CORNER</span><h1>A softer moment, <em>just for you.</em></h1><p className="intro">Choose a small tool. You don't need to feel a certain way for it to be useful.</p><div className="stack">{Object.entries(exercises).map(([k,v],i)=><article className="calm-card" key={k}><span className="num">0{i+1}</span><h2>{v.title}</h2><p>{v.body}</p><button className="text-button" onClick={()=>{setExercise(k);setTab("checkin")}}>Try this exercise <ChevronRight size={16}/></button></article>)}</div><p className="tiny muted">These are general self-care tools, not mental-health treatment. If distress feels intense or persistent, consider reaching out to someone trusted or a qualified professional.</p></section>}
+      {tab==="calm" && <section className="page calm-page"><Back onClick={()=>setTab("home")}/><span className="eyebrow"><Wind size={14}/> YOUR BREATHING STUDIO</span><h1>Come back to <em>yourself.</em></h1><p className="intro">A small pause, just for you. Pick a rhythm that feels comfortable and follow the circle. You can stop whenever you want.</p>
+        <div className="breathing-options">{Object.entries(breathingPresets).map(([key,preset])=><button key={key} className={`breathing-option ${breathingType===key?"selected":""}`} onClick={()=>{setBreathingType(key);setBreathingElapsed(0);setBreathingFinished(false);setBreathingRunning(false)}}><span className="breath-option-icon"><Wind size={18}/></span><strong>{preset.name}</strong><small>{preset.subtitle}</small><span className="breath-duration"><Timer size={13}/>{Math.ceil(preset.duration/60)} min</span></button>)}</div>
+        <div className={`breathing-session ${breathingRunning?"is-running":""} ${breathingFinished?"is-finished":""}`}>
+          <div className="session-top"><span><Sparkles size={14}/> GUIDED SESSION</span><span>{Math.ceil(breathingPresets[breathingType].duration/60)} MIN</span></div>
+          <div className="breathing-orb-wrap"><div className={`breathing-orb ${breathingRunning?"orb-active":""} ${breathingType==="box"?"orb-box":""}`} style={{animationDuration:`${breathingPresets[breathingType].phases.reduce((sum,phase)=>sum+phase.seconds,0)}s`}}><div className="breathing-orb-inner"><Wind size={25}/><strong>{breathingFinished?"Lovely work":breathingRunning?currentBreathPhase(breathingPresets[breathingType],breathingElapsed).label:"Ready when you are"}</strong><small>{breathingFinished?"You made a little space for yourself.":breathingRunning?`${currentBreathRemaining(breathingPresets[breathingType],breathingElapsed)} seconds in this step`:"Relax your jaw and shoulders"}</small></div></div></div>
+          <div className="session-progress"><div><span>TIME</span><strong>{String(Math.floor(breathingElapsed/60)).padStart(2,"0")}:{String(breathingElapsed%60).padStart(2,"0")}</strong></div><div className="progress-track"><span style={{width:`${Math.min(100,breathingElapsed/breathingPresets[breathingType].duration*100)}%`}}/></div><div><span>GOAL</span><strong>{String(Math.floor(breathingPresets[breathingType].duration/60)).padStart(2,"0")}:{String(breathingPresets[breathingType].duration%60).padStart(2,"0")}</strong></div></div>
+          <p className="breathing-note">{breathingFinished?"You don't have to feel different for this moment to count.":breathingPresets[breathingType].note}</p>
+          <div className="session-controls">{!breathingFinished?<button className="primary" onClick={()=>setBreathingRunning(v=>!v)}>{breathingRunning?<><Pause size={17}/> Pause session</>:<><Play size={17} fill="currentColor"/> {breathingElapsed>0?"Continue breathing":"Begin breathing"}</>}</button>:<button className="primary" onClick={()=>{setBreathingElapsed(0);setBreathingFinished(false);setBreathingRunning(false)}}><Check size={17}/> Start again</button>}<button className="reset-button" aria-label="Reset breathing session" onClick={()=>{setBreathingElapsed(0);setBreathingFinished(false);setBreathingRunning(false)}}><RotateCcw size={16}/> Reset</button></div>
+        </div>
+        <div className="breath-safety"><ShieldCheck size={19}/><p><strong>Comfort first</strong><br/>Breathe normally if you feel dizzy, breathless, or uncomfortable. Skip pauses and stop at any time. This is a relaxation tool, not medical treatment.</p></div>
+        <div className="heading calm-heading"><div><span className="eyebrow">MORE GENTLE TOOLS</span><h2>What else might help?</h2></div></div>
+        <div className="stack">{Object.entries(exercises).map(([k,v],i)=><article className="calm-card" key={k}><span className="num">0{i+1}</span><h2>{v.title}</h2><p>{v.body}</p><button className="text-button" onClick={()=>{setExercise(k);setTab("checkin")}}>Try this exercise <ChevronRight size={16}/></button></article>)}</div>
+        <p className="tiny muted">These are general self-care tools, not mental-health treatment. If distress feels intense or persistent, consider reaching out to someone trusted or a qualified professional.</p></section>}
 
       {tab==="journal" && <section className="page"><Back onClick={()=>setTab("home")}/><span className="eyebrow">PRIVATE JOURNAL</span><h1>Put it into <em>words.</em></h1><p className="intro">This space is for you. Write as much or as little as you want.</p><div className="card"><label>Your note<textarea rows="6" value={journalText} onChange={e=>setJournalText(e.target.value)} placeholder="Today, I'm feeling…"/></label><button className="primary full" onClick={addJournal}>Save private note <BookHeart size={17}/></button></div>{data.journal.map(entry=><article className="journal-entry" key={entry.id}><small>{fmt(entry.date)}</small><p>{entry.text}</p></article>)}</section>}
 
@@ -314,5 +385,17 @@ export default function App() {
     <nav className="bottom-nav">{[["home","Home",Heart],["cycle","Cycle",CalendarDays],["checkin","Check-in",Smile],["calm","Calm",Sparkles],["journal","Journal",BookHeart]].map(([k,v,Icon])=><button key={k} className={tab===k?"active":""} onClick={()=>setTab(k)}><Icon size={19}/><span>{v}</span></button>)}</nav>
     <footer><span>made with care <Heart size={12} fill="currentColor"/></span><span>VedaBloom · private wellness MVP</span></footer>
   </div>;
+}
+function currentBreathPhase(preset,elapsed) {
+  const cycle=preset.phases.reduce((sum,phase)=>sum+phase.seconds,0);
+  let position=elapsed%cycle;
+  for(const phase of preset.phases){if(position<phase.seconds)return phase;position-=phase.seconds;}
+  return preset.phases[0];
+}
+function currentBreathRemaining(preset,elapsed) {
+  const cycle=preset.phases.reduce((sum,phase)=>sum+phase.seconds,0);
+  let position=elapsed%cycle;
+  for(const phase of preset.phases){if(position<phase.seconds)return phase.seconds-position;position-=phase.seconds;}
+  return preset.phases[0].seconds;
 }
 function Back({onClick}) { return <button className="back" onClick={onClick}><ChevronLeft size={17}/> Home</button>; }
